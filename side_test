@@ -1,0 +1,141 @@
+from marshmallow import Schema, fields
+import io, json, schemas, requests
+import operator
+import xgclient as xg, pandas as pd
+from xgclient.client import ExpectedGoalsClient
+import numpy as np
+from datetime import datetime
+import statsmodels.api as sm
+from scipy import stats
+
+api_key = "0503ba26dbmshdecbd9737ecbe75p1b24dajsn5129c0f352ae"
+
+client = ExpectedGoalsClient(api_key)
+
+raw_db = pd.DataFrame()
+for country in client.countries():
+	for tournament in client.tournaments(country['id']):
+		for season in client.seasons(tournament['id']):
+			print(country['name'], tournament['name'], season['name'], season['id'])
+			print('=====')
+
+			season_fixtures = client.fixtures(season['id'])
+			raw_db = pd.concat([raw_db,pd.json_normalize(season_fixtures)], axis = 0)
+raw_db = raw_db.reset_index()
+
+raw_db['startTime_dt'] = pd.to_datetime(raw_db['startTime'], unit='s')
+raw_db['updateTime_dt'] = pd.to_datetime(raw_db['updateTime'], unit='s')
+raw_db['const'] = 1
+
+finished = raw_db[raw_db['status'] == "finished"].reset_index()
+
+#get xg statistics for the current maxture
+finished["homeTeam.xg"] = np.nan
+finished["awayTeam.xg"] = np.nan
+for i in list(range(0,len(finished))):
+	event_db = pd.DataFrame.from_records(finished['events'][i])
+	finished.at[i,"homeTeam.xg"] = event_db[event_db["teamId"] == finished["homeTeam.id"][i]]["xg"].aggregate('sum')
+	finished.at[i, "awayTeam.xg"] = event_db[event_db["teamId"] == finished["awayTeam.id"][i]]["xg"].aggregate('sum')
+finished["homeTeam.xg90"] = finished['homeTeam.xg'] / (finished["duration.firstHalf"] + finished['duration.secondHalf']) * 90
+finished["awayTeam.xg90"] = finished['awayTeam.xg'] / (finished["duration.firstHalf"] + finished['duration.secondHalf']) * 90
+
+
+finished["homeTeam.xg_5"] = np.nan
+finished["awayTeam.xg_5"] = np.nan
+finished["homeTeam.xg_10"] = np.nan
+finished["awayTeam.xg_10"] = np.nan
+for i in list(range(0,len(finished))):
+	for last in [5,10]:
+		db = finished[(finished['homeTeam.id'] == finished['homeTeam.id'][i]) | (finished['awayTeam.id'] == finished['homeTeam.id'][i])]
+		db = db[db['startTime_dt'] < finished['startTime_dt'][i]].sort_values("startTime_dt", ascending = False)
+		db = db.head(last)
+		db['xg90'] = np.where(db['homeTeam.id'] == finished['homeTeam.id'][i], db['homeTeam.xg90'],
+				   np.where(db['awayTeam.id'] == finished['homeTeam.id'][i], db['awayTeam.xg90'], np.nan))
+		finished.at[i, 'homeTeam.xg_' + str(last)] = db['xg90'].aggregate('mean')
+
+		db = finished[(finished['homeTeam.id'] == finished['awayTeam.id'][i]) | (finished['awayTeam.id'] == finished['awayTeam.id'][i])]
+		db = db[db['startTime_dt'] < finished['startTime_dt'][i]].sort_values("startTime_dt", ascending = False)
+		db = db.head(last)
+		db['xg90'] = np.where(db['homeTeam.id'] == finished['awayTeam.id'][i], db['homeTeam.xg90'],
+				   np.where(db['awayTeam.id'] == finished['awayTeam.id'][i], db['awayTeam.xg90'], np.nan))
+		finished.at[i, 'awayTeam.xg_' + str(last)] = db['xg90'].aggregate('mean')
+
+
+
+corr = finished[["homeScore.final", 'homeTeam.xg90', 'awayTeam.xg90', "homeTeam.xg_5", "awayTeam.xg_5", "homeTeam.xg_10", "awayTeam.xg_10"]].corr()
+finished[["awayScore.final", 'homeTeam.xg', 'awayTeam.xg', 'homeTeam.xg90', 'awayTeam.xg90']].corr()
+
+for target in ["homeScore.final", "awayScore.final"]:
+	factors = ["homeTeam.xg_10", "awayTeam.xg_10"]
+	poisson_model = sm.GLM(finished[target], finished[factors], missing='drop', family=sm.families.Poisson()).fit()
+	print(poisson_model.summary())
+	finished[target + "_hat"] = poisson_model.predict(finished[factors])
+
+def prob(lambda1, lambda2):
+	prob1 = stats.poisson.pmf(np.arange(10), lambda1)
+	prob2 = stats.poisson.pmf(np.arange(10), lambda2)
+	win1 = 0
+	draw = 0
+	win2 = 0
+	totalOver25 = 0
+	totalUnder25 = 0
+	for i in list(range(0,10)):
+		for j in list(range(0,10)):
+			if i > j:  win1 = win1 + prob1[i] * prob2[j]
+			if i == j: draw = draw + prob1[i] * prob2[j]
+			if i < j:  win2 = win2 + prob1[i] * prob2[j]
+			if (i + j) > 2.5: totalOver25 = totalOver25 + prob1[i] * prob2[j]
+			if (i + j) < 2.5: totalUnder25 = totalUnder25 + prob1[i] * prob2[j]
+	return win1, draw, win2, totalOver25, totalUnder25
+
+finished['home_true'] = 1 * (finished["homeScore.final"] > finished["awayScore.final"])
+finished['draw_true'] = 1 * (finished["homeScore.final"] == finished["awayScore.final"])
+finished['away_true'] = 1 * (finished["homeScore.final"] < finished["awayScore.final"])
+finished['totalOver25_true'] = 1 * (finished["homeScore.final"] + finished["awayScore.final"] > 2.5)
+finished['totalUnder25_true'] = 1 * (finished["homeScore.final"] + finished["awayScore.final"] < 2.5)
+
+for phase in ['open', "last"]:
+	for type in ["home","draw","away","totalOver25","totalUnder25"]:
+		finished[type + "_prob_" + phase] = 0
+		finished['return_' + type + "_" + phase] = 0
+	finished['return_' + phase] = 0
+
+for i in list(range(0, len(finished))):
+	win1, draw, win2, totalOver25, totalUnder25 = prob(finished["homeScore.final_hat"][i], finished["awayScore.final_hat"][i])
+	finished.at[i,"home_prob"] = win1
+	finished.at[i, "draw_prob"] = draw
+	finished.at[i, "away_prob"] = win2
+	finished.at[i, "totalOver25_prob"] = totalOver25
+	finished.at[i, "totalUnder25_prob"] = totalUnder25
+
+	odds_db = pd.DataFrame.from_records(finished['odds'][i])
+	for phase in ['open', "last"]:
+		for type in ["home","draw","away","totalOver25","totalUnder25"]:
+			finished.at[i,type + "_prob_" + phase] = 1 / float(odds_db[odds_db['type'] == type][phase])
+
+open = pd.DataFrame()
+for margin in list(range(0,11)):
+	for i in list(range(0, len(finished))):
+		for phase in ['open', "last"]:
+			finished.at[i, "return_" + phase] = 0
+			for type in ["home","draw","away","totalOver25","totalUnder25"]:
+				if (finished.at[i,type + "_prob"] > finished.at[i,type + "_prob_" + phase] + margin/100):
+					finished.at[i, 'return_' + type + "_" + phase] = float(odds_db[odds_db['type'] == type][phase]) * (finished.at[i,type + "_true"]) - 1
+				else:
+					finished.at[i, 'return_' + type + "_" + phase] = 0
+
+				finished.at[i,"return_" + phase] = finished.at[i,"return_" + phase] + finished.at[i, 'return_' + type + "_" + phase]
+	res = finished.groupby("season.name")[["return_home_open","return_away_open","return_draw_open","return_totalOver25_open","return_totalUnder25_open","return_open"]].sum()
+	res["margin"] = margin
+	open = pd.concat([open,res], axis = 0)
+	res = finished.groupby("season.name")[["return_home_last","return_away_last","return_draw_last",
+										   "return_totalOver25_last","return_totalUnder25_last","return_last"]].sum()
+	res["margin"] = margin
+	open = pd.concat([open,res], axis = 0)
+
+ch = finished[['home_prob', "home_true","home_prob_open","home_prob_last", "return_home_open","return_home_last"]]
+ch = finished[['away_prob', "away_true","away_prob_open","away_prob_last", "return_away_open","return_away_last"]]
+
+ch = finished[["return_home_open","return_away_open","return_draw_open","return_totalOver25_open","return_totalUnder25_open","return_open"]]
+
+
